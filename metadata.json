@@ -1,0 +1,6 @@
+{
+  "name": "JunoScratch Modulator",
+  "description": "A 90s Juno-inspired granular scratch and time-stretching sampler for experimental audio processing.",
+  "requestFramePermissions": ["midi"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
