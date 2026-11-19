@@ -11,6 +11,7 @@ import {
   KickClipMode,
   KickLfoShape,
   KickLfoTarget,
+  KickPhaseMode,
   KickTailType,
   Point,
   SynthLfoTarget,
@@ -54,6 +55,50 @@ function clamp(v: number, min: number, max: number): number {
 
 function midiToFreq(midi: number): number {
   return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+const TWO_PI = Math.PI * 2;
+
+function polyBlep(u: number, dt: number): number {
+  if (dt <= 1e-7) return 0;
+  if (u < dt) {
+    const x = u / dt;
+    return x + x - x * x - 1;
+  }
+  if (u > 1 - dt) {
+    const x = (u - 1) / dt;
+    return x * x + x + x + 1;
+  }
+  return 0;
+}
+
+/**
+ * Band-limited, positive-leading zero-DC oscillator evaluator for Phase-Locked & Hard-Synced Kick Synthesis.
+ * All 4 shapes share positive polarity across u in (0, 0.5) so body, sub, knock, and harmonic layers reinforce constructively.
+ */
+function evalKickWave(type: OscillatorType, phaseRad: number, dt: number): number {
+  const u = (((phaseRad / TWO_PI) % 1) + 1) % 1;
+  switch (type) {
+    case 'sine':
+      return Math.sin(u * TWO_PI);
+    case 'triangle':
+      return u < 0.25 ? 4 * u : u < 0.75 ? 2 - 4 * u : -4 + 4 * u;
+    case 'sawtooth':
+      return 1 - 2 * u + polyBlep(u, dt);
+    case 'square':
+    default: {
+      const halfU = (u + 0.5) % 1;
+      return (u < 0.5 ? 1 : -1) + polyBlep(u, dt) - polyBlep(halfU, dt);
+    }
+  }
+}
+
+function evalKickLfoShape(shape: KickLfoShape, phase01: number): number {
+  const lp = ((phase01 % 1) + 1) % 1;
+  if (shape === 'SINE') return Math.sin(lp * TWO_PI);
+  if (shape === 'TRI') return lp < 0.5 ? 1 - 4 * lp : -1 + 4 * (lp - 0.5);
+  if (shape === 'SAW') return 1 - 2 * lp;
+  return Math.tanh(Math.sin(lp * TWO_PI) * 9);
 }
 
 /**
@@ -117,6 +162,29 @@ function rampAudioGate(
       param.cancelScheduledValues(now);
     }
     param.setTargetAtTime(target, now, safeTau);
+  } catch {
+    param.value = target;
+  }
+}
+
+/**
+ * Cancels all active/indefinite Web Audio timeline automations (such as prior
+ * `setTargetAtTime` events) and anchors `param` immediately at `target`.
+ */
+function setAudioParamImmediate(
+  param: AudioParam | Tone.Param<any> | null | undefined,
+  target: number,
+  now: number
+): void {
+  if (!param || !Number.isFinite(target)) return;
+  try {
+    if (typeof param.cancelScheduledValues === 'function') {
+      param.cancelScheduledValues(0);
+    }
+    param.value = target;
+    if (typeof param.setValueAtTime === 'function') {
+      param.setValueAtTime(target, Math.max(0, now));
+    }
   } catch {
     param.value = target;
   }
@@ -594,16 +662,20 @@ export class AudioEngine {
   private synthLfoAmpGain: GainNode | null = null;
   private synthSubEnvGain: GainNode | null = null;
 
-  // Kick & Master Chain (100% Phase-Locked Per-Hit Native Web Audio C++ Voices + Deterministic Tok + Krach + Rumble)
+  // Kick & Master Chain (Sample-Exact Phase-Reset & Hard-Sync Kick Engine + Cached AudioBuffer + Krach + Rumble)
   private activeKickVoices: {
     chokeGain: GainNode;
-    fmGain: GainNode | null;
     stopAt: number;
-    sources: AudioScheduledSourceNode[];
+    sources: AudioBufferSourceNode[];
     nodes: AudioNode[];
   }[] = [];
-  private kickBodyDetuneSource: ConstantSourceNode | null = null;
-  private kickHarmDetuneSource: ConstantSourceNode | null = null;
+  private cachedKickBuffer: AudioBuffer | null = null;
+  private cachedKickKey = '';
+  private freeKickBodyPhase = 0;
+  private freeKickSubPhase = 0;
+  private freeKickHarmPhase = 0;
+  private freeKickKnockPhase = 0;
+  private liveKickFreeRate = 1.0;
   private kickTokBuffer: AudioBuffer | null = null;
   private kickLfoAmpGain: GainNode | null = null;
   private kickTokBpFilter: BiquadFilterNode | null = null;
@@ -888,7 +960,7 @@ export class AudioEngine {
   private isKickVoiceWired = false;
   private isKickKrachWired = false;
   private isKickRumbleWired = false;
-  private isKickFullBandDirectWired = false;
+  private kickDirectRoutingMode: 'XOVER' | 'FILTERED_DIRECT' | 'PURE_DIRECT' = 'XOVER';
 
   private isCombWired = false;
   private isCrushWired = false;
@@ -989,6 +1061,10 @@ export class AudioEngine {
     if (Tone.getContext().state !== 'running') {
       await Tone.start();
     }
+    const rawCtx = Tone.getContext().rawContext as AudioContext;
+    if (rawCtx && rawCtx.state !== 'running' && typeof rawCtx.resume === 'function') {
+      await rawCtx.resume();
+    }
   }
 
   private setCrushTier(tier: number): void {
@@ -1070,16 +1146,17 @@ export class AudioEngine {
 
   private suspendVoicesWhenSilent(): void {
     if (!this.isGraphBuilt || !this.isVoicesAwake) return;
-    if (this.oscVoiceGate) this.oscVoiceGate.gain.value = 0;
-    if (this.fmVoiceGate) this.fmVoiceGate.gain.value = 0;
-    if (this.subDirectGate) this.subDirectGate.gain.value = 0;
-    if (this.grainGate) this.grainGate.gain.value = 0;
-    if (this.synthAmpEnvGain) this.synthAmpEnvGain.gain.value = 0;
-    if (this.synthSubEnvGain) this.synthSubEnvGain.gain.value = 0;
-    if (this.synthLfoAmpGain) this.synthLfoAmpGain.gain.value = 1;
-    if (this.kickVoiceGate) this.kickVoiceGate.gain.value = 0;
+    const rawNow = Tone.getContext().rawContext.currentTime;
+    if (this.oscVoiceGate) setAudioParamImmediate(this.oscVoiceGate.gain, 0, rawNow);
+    if (this.fmVoiceGate) setAudioParamImmediate(this.fmVoiceGate.gain, 0, rawNow);
+    if (this.subDirectGate) setAudioParamImmediate(this.subDirectGate.gain, 0, rawNow);
+    if (this.grainGate) setAudioParamImmediate(this.grainGate.gain, 0, rawNow);
+    if (this.synthAmpEnvGain) setAudioParamImmediate(this.synthAmpEnvGain.gain, 0, rawNow);
+    if (this.synthSubEnvGain) setAudioParamImmediate(this.synthSubEnvGain.gain, 0, rawNow);
+    if (this.synthLfoAmpGain) setAudioParamImmediate(this.synthLfoAmpGain.gain, 1, rawNow);
+    if (this.kickVoiceGate) setAudioParamImmediate(this.kickVoiceGate.gain, 0, rawNow);
     this.stopAllKickVoices();
-    if (this.rumbleDuckGain) this.rumbleDuckGain.gain.value = 0;
+    if (this.rumbleDuckGain) setAudioParamImmediate(this.rumbleDuckGain.gain, 0, rawNow);
 
     disconnectSafe(this.synthLfoAmpGain, this.inputGain);
     disconnectSafe(this.synthSubEnvGain, this.compressor);
@@ -1138,8 +1215,9 @@ export class AudioEngine {
         connectSafe(this.kickDryPunchSum, this.rumbleIn);
       } else {
         disconnectSafe(this.kickDryPunchSum, this.rumbleIn);
-        if (this.rumbleDuckGain) this.rumbleDuckGain.gain.value = 0;
-        if (this.rumbleFbGain) this.rumbleFbGain.gain.value = 0;
+        const rawNow = Tone.getContext().rawContext.currentTime;
+        if (this.rumbleDuckGain) setAudioParamImmediate(this.rumbleDuckGain.gain, 0, rawNow);
+        if (this.rumbleFbGain) setAudioParamImmediate(this.rumbleFbGain.gain, 0, rawNow);
       }
       this.isKickRumbleWired = wantKickRumble;
     }
@@ -1163,18 +1241,30 @@ export class AudioEngine {
       Math.abs(p.phaseAlignDeg ?? 0) > 0.5 ||
       Boolean(p.phaseInvertR) ||
       Boolean(p.subSolo);
-    const wantKickFullBandDirect = !p.bypass && inKickMode && !anyMidShaperActiveInKick;
-    if (wantKickFullBandDirect !== this.isKickFullBandDirectWired) {
-      if (wantKickFullBandDirect) {
+
+    const utilityFiltersNeutral = (p.hpFreq ?? 20) <= 28.5 && (p.lpFreq ?? 20000) >= 17500;
+    const targetDirectMode: 'XOVER' | 'FILTERED_DIRECT' | 'PURE_DIRECT' =
+      !p.bypass && inKickMode && !anyMidShaperActiveInKick
+        ? utilityFiltersNeutral
+          ? 'PURE_DIRECT'
+          : 'FILTERED_DIRECT'
+        : 'XOVER';
+
+    if (targetDirectMode !== this.kickDirectRoutingMode) {
+      disconnectSafe(this.inputGain, this.kickFullBandDirect);
+      disconnectSafe(this.lpFilter, this.kickFullBandDirect);
+      disconnectSafe(this.lpFilter, this.xoverLow1);
+      disconnectSafe(this.lpFilter, this.xoverHigh1);
+
+      if (targetDirectMode === 'PURE_DIRECT') {
+        connectSafe(this.inputGain, this.kickFullBandDirect);
+      } else if (targetDirectMode === 'FILTERED_DIRECT') {
         connectSafe(this.lpFilter, this.kickFullBandDirect);
-        disconnectSafe(this.lpFilter, this.xoverLow1);
-        disconnectSafe(this.lpFilter, this.xoverHigh1);
       } else {
         connectSafe(this.lpFilter, this.xoverLow1);
         connectSafe(this.lpFilter, this.xoverHigh1);
-        disconnectSafe(this.lpFilter, this.kickFullBandDirect);
       }
-      this.isKickFullBandDirectWired = wantKickFullBandDirect;
+      this.kickDirectRoutingMode = targetDirectMode;
     }
 
     // 0. Selective Oscillator Sub-Branch Gating (unused Tone oscillators aren't pulled!)
@@ -2824,12 +2914,6 @@ export class AudioEngine {
     this.kickVoiceGate = rawCtx.createGain();
     this.kickVoiceGate.gain.value = 0;
 
-    this.kickBodyDetuneSource = rawCtx.createConstantSource();
-    this.kickBodyDetuneSource.offset.value = 0;
-
-    this.kickHarmDetuneSource = rawCtx.createConstantSource();
-    this.kickHarmDetuneSource.offset.value = 0;
-
     // Pre-generate 100% deterministic, phase-aligned analog TR-909 Tok click buffer (zero random live noise!)
     const tokSr = rawCtx.sampleRate || 44100;
     const tokLen = Math.max(64, Math.floor(tokSr * 0.036));
@@ -2953,19 +3037,15 @@ export class AudioEngine {
     this.rumbleDuckGain.channelCountMode = 'explicit';
     this.rumbleDuckGain.gain.value = 0;
 
-    // Wire Native Kick Bus (per-hit phase-locked voices connect into kickLfoAmpGain & kickTokBpFilter!)
+    // Wire Native Kick Bus:
+    // Dry kick path connects directly with zero shared stateful IIR filters (sub reinforcement & 28Hz DC block
+    // are rendered per-hit from exact 0.0 filter state inside `renderPhaseLockedKickBuffer`!).
     this.kickLfoAmpGain.connect(this.kickRawSum);
-    this.kickTokBpFilter.connect(this.kickRawSum);
-
-    this.kickRawSum.connect(this.kickSubLp);
-    this.kickSubLp.connect(this.kickSubReinforce);
-    this.kickSubReinforce.connect(this.kickVoiceGate);
-
-    this.kickRawSum.connect(this.kickPreHp);
-    this.kickPreHp.connect(this.kickDryKrachGain);
+    this.kickRawSum.connect(this.kickDryKrachGain);
     this.kickDryKrachGain.connect(this.kickDryPunchSum);
 
-    // Pre-EQ + Multi-Stage Clipper wet branch (input kickPreHp -> kickPreEq dynamically gated!)
+    // Pre-HP + Pre-EQ + Multi-Stage Clipper wet branch (kickPreHp -> kickPreEq dynamically gated!)
+    this.kickRawSum.connect(this.kickPreHp);
     this.kickPreEq.connect(this.kickPreDrive);
     this.kickPreDrive.connect(this.kickShaper);
     this.kickShaper.connect(this.kickPostHp);
@@ -2987,9 +3067,6 @@ export class AudioEngine {
     this.rumbleLp.connect(this.rumbleShaper);
     this.rumbleShaper.connect(this.rumbleDuckGain);
     this.rumbleDuckGain.connect(this.kickVoiceGate);
-
-    this.kickBodyDetuneSource.start(startAt);
-    this.kickHarmDetuneSource.start(startAt);
 
     // =========================================================================
     // 3. Wire 115 Hz Multiband Crossover + Growl + Dynamic Sonic Shaper Stages
@@ -3287,19 +3364,23 @@ export class AudioEngine {
       const glideCoef = p.glideMs <= 5 ? 1 : clamp(intervalMs / Math.max(8, p.glideMs), 0.08, 1);
       this.currentFreqHz += (targetHz - this.currentFreqHz) * glideCoef;
 
-      // Sample-Accurate 4/4 BPM Kick Stomper Scheduler (85ms Lookahead -> Zero Jitter, Identical Beats)
+      // Sample-Accurate Integer-Frame Quantized 4/4 BPM Kick Scheduler (Zero Sub-Sample Phase Drift!)
       if (p.kickMode && (p.kickPower ?? true)) {
-        const bpm = clamp(p.kickBpm ?? 150, 115, 240);
-        const beatSec = 60 / bpm;
+        const sr = rawCtx.sampleRate || 48000;
+        const beatSamples = this.getQuantizedKickBeatSamples(p, sr);
+        const beatSec = beatSamples / sr;
 
         if (isHeldOrDrone && p.kickLoop) {
           if (this.nextKickHitTime <= audioNow - 0.12) {
-            this.nextKickHitTime = audioNow + 0.008;
+            const startFrame = Math.ceil((audioNow + 0.008) * sr);
+            this.nextKickHitTime = startFrame / sr;
           }
           while (this.nextKickHitTime <= audioNow + 0.085) {
+            const exactFrame = Math.round(this.nextKickHitTime * sr);
+            const exactHitTime = exactFrame / sr;
             const kickRootHz = this.computeKickRootHz(targetMidi);
-            this.triggerKickHit(this.nextKickHitTime, kickRootHz, p);
-            this.nextKickHitTime += beatSec;
+            this.triggerKickHit(exactHitTime, kickRootHz, p);
+            this.nextKickHitTime = (exactFrame + beatSamples) / sr;
           }
         }
 
@@ -3444,41 +3525,39 @@ export class AudioEngine {
           ? clamp((p.kickLfoDepth ?? 0) / 100, 0, 1)
           : 0;
 
-      if (
-        this.kickBodyDetuneSource &&
-        this.kickHarmDetuneSource &&
-        this.kickLfoAmpGain
-      ) {
-        if (kickLfoDepthNorm > 0.005) {
+      const kickLfoSynced = p.kickLfoSync ?? true;
+      if (this.kickLfoAmpGain) {
+        if (kickLfoDepthNorm > 0.005 && !kickLfoSynced) {
+          // Free-running Kick LFO modulates live playbackRate & amp across beats;
+          // when `kickLfoSync` is ON, PITCH / FM / AMP are evaluated at full sample accuracy from phase=0 inside `renderPhaseLockedKickBuffer`!
           const bodyCents =
             kickLfoTarget === 'PITCH' ? kickLfoVal * kickLfoDepthNorm * 700 : 0;
-          const harmCents =
-            kickLfoTarget === 'PITCH'
-              ? kickLfoVal * kickLfoDepthNorm * 700
-              : kickLfoTarget === 'FM'
-              ? kickLfoVal * kickLfoDepthNorm * 420
-              : 0;
-          const fmGainTarget =
-            kickLfoTarget === 'FM'
-              ? this.baseKickFmGain * clamp(1 + kickLfoVal * kickLfoDepthNorm * 0.9, 0.06, 2.3)
-              : this.baseKickFmGain;
+          const rateRatio = bodyCents !== 0 ? Math.pow(2, bodyCents / 1200) : 1.0;
+          this.liveKickFreeRate = rateRatio;
+          for (const v of this.activeKickVoices) {
+            for (const s of v.sources) {
+              if (s.playbackRate) {
+                setParamSmooth(s.playbackRate, rateRatio, 0.55, 0.002);
+              }
+            }
+          }
           const ampGateTarget =
             kickLfoTarget === 'AMP'
               ? clamp(1 - ((1 - kickLfoVal) * 0.5) * kickLfoDepthNorm * 0.94, 0.04, 1.0)
               : 1.0;
-
-          setParamSmooth(this.kickBodyDetuneSource.offset, bodyCents, 0.55, 0.5);
-          setParamSmooth(this.kickHarmDetuneSource.offset, harmCents, 0.55, 0.5);
-          for (const v of this.activeKickVoices) {
-            if (v.fmGain) {
-              setParamSmooth(v.fmGain.gain, fmGainTarget, 0.5, 0.2);
-            }
-          }
           setParamSmooth(this.kickLfoAmpGain.gain, ampGateTarget, 0.55, 0.005);
         } else {
-          setParamSmooth(this.kickBodyDetuneSource.offset, 0, 0.5, 0.5);
-          setParamSmooth(this.kickHarmDetuneSource.offset, 0, 0.5, 0.5);
-          setParamSmooth(this.kickLfoAmpGain.gain, 1.0, 0.5, 0.005);
+          if (this.liveKickFreeRate !== 1.0) {
+            this.liveKickFreeRate = 1.0;
+            for (const v of this.activeKickVoices) {
+              for (const s of v.sources) {
+                if (s.playbackRate) {
+                  setParamDirect(s.playbackRate, 1.0);
+                }
+              }
+            }
+          }
+          setParamDirect(this.kickLfoAmpGain.gain, 1.0);
         }
       }
 
@@ -4367,31 +4446,517 @@ export class AudioEngine {
     }
   }
 
+  private getQuantizedKickBeatSamples(p: SynthParams, sr: number): number {
+    const bpm = clamp(p.kickBpm ?? 165, 115, 240);
+    return Math.max(2048, Math.round((60 / bpm) * sr));
+  }
+
   /**
-   * 100% Phase-Locked (0.0 rad) Per-Hit Web Audio Kick Synthesizer.
-   * Every kick hit spawns fresh sample-accurate C++ oscillators + deterministic Tok buffer at exact `t0`
-   * while cleanly micro-choking any prior voice in 2.0 ms — guaranteeing hard, sample-identical kicks on every beat!
+   * 64-Bit Sample-Exact Phase-Reset & Master->Slave Hard-Sync Kick Buffer Synthesizer.
+   *
+   * Eliminates ALL sources of Web Audio kick loop phase drift:
+   *  1. Resets `body`, `subSine`, `harm` (FM), `knock`, and `tok` accumulators to exact `kickPhaseDeg` at sample `n = 0` ('RESET' & 'HARD').
+   *  2. In 'HARD' mode, hard-syncs the harmonic/FM slave oscillator on every `2π` cycle wrap of the master body oscillator.
+   *  3. Evaluates per-hit `< 88 Hz` sub reinforcement, `2550..4200 Hz` tok bandpass, and `28 Hz` DC block from freshly zeroed IIR state (`z1 = 0, z2 = 0`).
+   *  4. Caches the rendered `AudioBuffer` by parameter signature so steady-state loops play the exact bit-identical `Float32Array` at 0% synthesis CPU.
+   */
+  private renderPhaseLockedKickBuffer(
+    rawCtx: BaseAudioContext,
+    rootHz: number,
+    p: SynthParams
+  ): AudioBuffer {
+    const sr = rawCtx.sampleRate || 48000;
+    const phaseMode: KickPhaseMode = p.kickPhaseMode ?? 'RESET';
+    const phaseDeg = clamp(p.kickPhaseDeg ?? 0, 0, 360);
+    const tailType: KickTailType = p.kickTailType ?? '909';
+    const punchNorm = clamp((p.kickPunch ?? 78) / 100, 0, 1);
+    const fmRatio = clamp(p.kickFmRatio ?? 2.0, 0.5, 8.0);
+    const ratioBoost = 0.52 + fmRatio * 0.2;
+    const tokNorm = clamp((p.kickTok ?? 58) / 100, 0, 1);
+    const tokBoost = Boolean(p.kickTokBoost);
+    const sweepSec = clamp((p.kickSweepMs ?? 42) / 1000, 0.008, 0.22);
+
+    const atkSec = clamp((p.kickAttackMs ?? 1.2) / 1000, 0.0005, 0.065);
+    const decSec = clamp((p.kickDecayMs ?? 280) / 1000, 0.04, 1.2);
+    const susNorm = clamp((p.kickSustain ?? 64) / 100, 0, 1);
+    const susGain = Math.max(0.0008, susNorm * 0.96);
+    const relSec = clamp((p.kickReleaseMs ?? 220) / 1000, 0.025, 1.2);
+    const loopMode = Boolean(p.kickLoop);
+    const beatSamples = this.getQuantizedKickBeatSamples(p, sr);
+    const beatSec = beatSamples / sr;
+
+    const lfoActive = Boolean(p.kickLfoPower) && !p.bypass && (p.kickLfoDepth ?? 0) > 0.5;
+    const lfoSynced = p.kickLfoSync ?? true;
+    const lfoShape: KickLfoShape = p.kickLfoShape ?? 'SAW';
+    const lfoTarget: KickLfoTarget = p.kickLfoTarget ?? 'HUNT';
+    const lfoRateHz = clamp(p.kickLfoRateHz ?? 4.0, 0.2, 24.0);
+    const lfoDepthNorm = lfoActive ? clamp((p.kickLfoDepth ?? 0) / 100, 0, 1) : 0;
+    const piepEqRefHz = tailType === 'PIEP' ? clamp(p.kickEqFreqHz ?? 2250, 240, 4200) : 0;
+
+    const canUseCache =
+      phaseMode !== 'FREE' && !(lfoActive && !lfoSynced && lfoTarget === 'FM');
+    const cacheKey = canUseCache
+      ? [
+          sr,
+          rootHz.toFixed(3),
+          phaseMode,
+          phaseDeg.toFixed(1),
+          tailType,
+          punchNorm.toFixed(3),
+          fmRatio.toFixed(3),
+          tokNorm.toFixed(3),
+          tokBoost ? 1 : 0,
+          sweepSec.toFixed(4),
+          atkSec.toFixed(5),
+          decSec.toFixed(4),
+          susNorm.toFixed(3),
+          relSec.toFixed(4),
+          loopMode ? beatSamples : 0,
+          piepEqRefHz.toFixed(1),
+          lfoActive && lfoSynced && lfoTarget !== 'HUNT'
+            ? `${lfoShape}:${lfoTarget}:${lfoRateHz.toFixed(2)}:${lfoDepthNorm.toFixed(3)}`
+            : 'NOLFO',
+        ].join('|')
+      : '';
+
+    if (canUseCache && this.cachedKickBuffer && this.cachedKickKey === cacheKey) {
+      return this.cachedKickBuffer;
+    }
+
+    // 1. Envelope timing & sample-accurate voice duration (never overlaps the next quantized beat!)
+    const effAtkSec = Math.max(0.0004, atkSec);
+    const decTau = Math.max(0.012, decSec * 0.28);
+    let sustainEndSec: number;
+    let relTau: number;
+    let totalSamples: number;
+
+    if (loopMode) {
+      const guardGapSamples = Math.max(32, Math.floor(sr * 0.0018));
+      const maxLoopSamples = Math.max(512, beatSamples - guardGapSamples);
+      const maxLoopSec = maxLoopSamples / sr;
+      const maxSustainEnd = Math.max(effAtkSec + 0.016, maxLoopSec * 0.74);
+      sustainEndSec = Math.min(
+        maxSustainEnd,
+        effAtkSec + decSec * 0.52 + beatSec * 0.24 * susNorm
+      );
+      relTau = Math.max(0.008, Math.min(relSec * 0.24, (maxLoopSec - sustainEndSec) * 0.36));
+      const naturalEndSamples = Math.ceil((sustainEndSec + relTau * 5.8) * sr);
+      totalSamples = Math.min(maxLoopSamples, Math.max(512, naturalEndSamples));
+    } else {
+      sustainEndSec = effAtkSec + decSec * 0.65 + susNorm * Math.min(0.32, decSec * 0.45);
+      relTau = Math.max(0.012, relSec * 0.3);
+      totalSamples = clamp(
+        Math.ceil((sustainEndSec + relTau * 5.8) * sr),
+        1024,
+        Math.ceil(sr * 2.2)
+      );
+    }
+
+    const totalEnvSec = totalSamples / sr;
+
+    // 2. Oscillator topology & analog gain balance
+    let bodyType: OscillatorType = 'sine';
+    let harmType: OscillatorType = 'triangle';
+    let bodyGainVal = 1.05;
+    let harmGainVal = 0.09;
+    let subGainVal = 0.4;
+    let baseFmHz = 0;
+    let subReinforceGain = 0.42;
+
+    switch (tailType) {
+      case '909':
+        bodyType = 'sine';
+        harmType = 'triangle';
+        bodyGainVal = 1.06;
+        harmGainVal = 0.09;
+        subGainVal = 0.42;
+        baseFmHz = 0;
+        subReinforceGain = 0.42;
+        break;
+      case 'SUB':
+        bodyType = 'sine';
+        harmType = 'sine';
+        bodyGainVal = 0.98;
+        harmGainVal = 0.2;
+        subGainVal = 0.36;
+        baseFmHz = (12 + punchNorm * 42) * ratioBoost;
+        subReinforceGain = 0.44;
+        break;
+      case 'SAW':
+        bodyType = 'sawtooth';
+        harmType = 'sawtooth';
+        bodyGainVal = 0.78;
+        harmGainVal = 0.42;
+        subGainVal = 0.5;
+        baseFmHz = (18 + punchNorm * 54) * ratioBoost;
+        subReinforceGain = 0.38;
+        break;
+      case 'ZAAG':
+        bodyType = 'sawtooth';
+        harmType = 'sawtooth';
+        bodyGainVal = 0.74;
+        harmGainVal = 0.56;
+        subGainVal = 0.52;
+        baseFmHz = (32 + punchNorm * 74) * ratioBoost;
+        subReinforceGain = 0.4;
+        break;
+      case 'KRACH':
+        bodyType = 'sawtooth';
+        harmType = 'square';
+        bodyGainVal = 0.78;
+        harmGainVal = 0.32;
+        subGainVal = 0.54;
+        baseFmHz = (115 + punchNorm * 260) * (0.62 + fmRatio * 0.14);
+        subReinforceGain = 0.42;
+        break;
+      case 'PIEP':
+        bodyType = 'sine';
+        harmType = 'sawtooth';
+        bodyGainVal = 0.86;
+        harmGainVal = 0.5;
+        subGainVal = 0.44;
+        baseFmHz = (26 + punchNorm * 64) * ratioBoost;
+        subReinforceGain = 0.4;
+        break;
+    }
+
+    // 3. Pitch-drop segment breakpoints (matching dual-slope analog bridged-T & hardstyle trajectories)
+    const sweepSemitones = tailType === '909' ? 18 + punchNorm * 28 : 18 + punchNorm * 44;
+    const peakBodyHz = clamp(
+      rootHz * Math.pow(2, sweepSemitones / 12),
+      110,
+      tailType === '909' ? 480 : 2600
+    );
+    const kneeHz =
+      tailType === '909'
+        ? Math.max(rootHz * 1.48, rootHz + 24)
+        : Math.max(rootHz * 1.55, rootHz + 28);
+    const fastSnapSec =
+      tailType === '909' ? Math.min(0.019, sweepSec * 0.34) : Math.min(0.018, sweepSec * 0.32);
+    const bodyLandSec = tailType === '909' ? sweepSec * 1.1 : sweepSec;
+    const bodyTailEndSec = bodyLandSec + Math.max(0.18, totalEnvSec * 0.85);
+    const bodyFloorHz =
+      tailType === '909' ? Math.max(28, rootHz * 0.97) : Math.max(24, rootHz * 0.94);
+
+    const subStartHz = Math.min(260, peakBodyHz * (tailType === '909' ? 0.72 : 0.52));
+    const subLandSec = sweepSec * 0.82;
+
+    let harmStartHz: number;
+    let harmEndHz: number;
+    let harmLandSec: number;
+    if (tailType === '909') {
+      harmStartHz = Math.min(520, peakBodyHz * 1.5);
+      harmEndHz = rootHz * 2;
+      harmLandSec = sweepSec * 0.7;
+    } else if (tailType === 'PIEP') {
+      harmEndHz = clamp((piepEqRefHz || 2250) * (0.55 + fmRatio * 0.28), 750, 4800);
+      harmStartHz = Math.min(6200, harmEndHz * 1.45);
+      harmLandSec = sweepSec * 0.75;
+    } else if (tailType === 'KRACH') {
+      harmEndHz = clamp(rootHz * fmRatio, 20, 6500);
+      harmStartHz = Math.min(7500, harmEndHz * 3.1);
+      harmLandSec = sweepSec * 0.9;
+    } else if (tailType === 'ZAAG') {
+      // In HARD sync mode, lock exact harmonic ratio (no 1.016x free beating); in RESET/FREE keep classic zaag edge
+      const det = phaseMode === 'HARD' ? 1.0 : 1.016;
+      harmEndHz = clamp(rootHz * fmRatio * det, 20, 6500);
+      harmStartHz = Math.min(7500, peakBodyHz * fmRatio * 0.82);
+      harmLandSec = sweepSec;
+    } else if (tailType === 'SAW') {
+      const det = phaseMode === 'HARD' ? 1.0 : 1.006;
+      harmEndHz = clamp(rootHz * fmRatio * det, 20, 6500);
+      harmStartHz = Math.min(7500, peakBodyHz * fmRatio * 0.82);
+      harmLandSec = sweepSec;
+    } else {
+      harmEndHz = clamp(rootHz * fmRatio, 18, 5200);
+      harmStartHz = Math.min(6000, peakBodyHz * fmRatio * 0.75);
+      harmLandSec = sweepSec * 0.75;
+    }
+
+    const knockType: OscillatorType = tailType === '909' ? 'sine' : 'triangle';
+    const knockStartHz = tokBoost ? 520 : tailType === '909' ? 320 : 380;
+    const knockEndHz = tailType === '909' ? 68 : 88;
+    const knockDurSec = tailType === '909' ? 0.021 : 0.016;
+    const knockPeakGain = tokNorm * (tailType === '909' ? 0.84 : 0.72);
+    const clickPeakGain = tokNorm * (tokBoost ? 0.92 : tailType === '909' ? 0.58 : 0.72);
+    const clickDurSec = tailType === '909' ? 0.0085 : 0.011;
+
+    // 4. Per-hit zero-initial-state RBJ Biquad coefficients (Tok BP, 88Hz Sub LP, 26Hz DC-Block HP)
+    const tokBpHz = tokBoost ? 4200 : tailType === '909' ? 2550 : 2850;
+    const tokW0 = (TWO_PI * clamp(tokBpHz, 400, sr * 0.44)) / sr;
+    const tokAlpha = Math.sin(tokW0) / (2 * 1.45);
+    const tokA0Inv = 1 / (1 + tokAlpha);
+    const tokB0 = tokAlpha * tokA0Inv;
+    const tokB2 = -tokAlpha * tokA0Inv;
+    const tokA1 = (-2 * Math.cos(tokW0)) * tokA0Inv;
+    const tokA2 = (1 - tokAlpha) * tokA0Inv;
+    let tokZ1 = 0;
+    let tokZ2 = 0;
+
+    const subW0 = (TWO_PI * 88) / sr;
+    const subCos = Math.cos(subW0);
+    const subAlpha = Math.sin(subW0) / (2 * Math.SQRT1_2);
+    const subA0Inv = 1 / (1 + subAlpha);
+    const subB0 = ((1 - subCos) * 0.5) * subA0Inv;
+    const subB1 = (1 - subCos) * subA0Inv;
+    const subB2 = subB0;
+    const subA1 = (-2 * subCos) * subA0Inv;
+    const subA2 = (1 - subAlpha) * subA0Inv;
+    let subZ1 = 0;
+    let subZ2 = 0;
+
+    const hpW0 = (TWO_PI * 26) / sr;
+    const hpCos = Math.cos(hpW0);
+    const hpAlpha = Math.sin(hpW0) / (2 * Math.SQRT1_2);
+    const hpA0Inv = 1 / (1 + hpAlpha);
+    const hpB0 = ((1 + hpCos) * 0.5) * hpA0Inv;
+    const hpB1 = -(1 + hpCos) * hpA0Inv;
+    const hpB2 = hpB0;
+    const hpA1 = (-2 * hpCos) * hpA0Inv;
+    const hpA2 = (1 - hpAlpha) * hpA0Inv;
+    let hpZ1 = 0;
+    let hpZ2 = 0;
+
+    // 5. Phase initialization: exact fixed startPhaseRad in 'RESET' & 'HARD', continuous in 'FREE'
+    const startPhaseRad = (phaseDeg * Math.PI) / 180;
+    let bodyPhase = phaseMode === 'FREE' ? this.freeKickBodyPhase : startPhaseRad;
+    let subPhase = phaseMode === 'FREE' ? this.freeKickSubPhase : startPhaseRad;
+    let harmPhase = phaseMode === 'FREE' ? this.freeKickHarmPhase : startPhaseRad;
+    let knockPhase = phaseMode === 'FREE' ? this.freeKickKnockPhase : startPhaseRad * 0.5;
+    let prevMasterCycle = Math.floor((bodyPhase - startPhaseRad) / TWO_PI);
+
+    const outBuf = rawCtx.createBuffer(1, totalSamples, sr);
+    const out = outBuf.getChannelData(0);
+    const tokData = this.kickTokBuffer ? this.kickTokBuffer.getChannelData(0) : null;
+    const tokDataLen = tokData ? tokData.length : 0;
+
+    const tailFadeSamples = Math.min(
+      Math.floor(totalSamples * 0.25),
+      Math.max(48, Math.floor(sr * (loopMode ? 0.0065 : 0.01)))
+    );
+    const tailFadeStart = totalSamples - tailFadeSamples;
+    const valAtSustainEnd =
+      sustainEndSec <= effAtkSec
+        ? 1.0
+        : susGain + (1.0 - susGain) * Math.exp(-(sustainEndSec - effAtkSec) / decTau);
+
+    const freeLfoStartPhase = this.kickLfoPhase;
+    let maxAbs = 0;
+
+    for (let i = 0; i < totalSamples; i++) {
+      const t = i / sr;
+
+      // Audio-rate Kick LFO evaluation (sample-exact from phase=0 when `kickLfoSync` is ON!)
+      let lfoVal = 0;
+      if (lfoDepthNorm > 0.005) {
+        const lfoPh = (lfoSynced ? 0 : freeLfoStartPhase) + t * lfoRateHz;
+        lfoVal = evalKickLfoShape(lfoShape, lfoPh);
+      }
+      const lfoPitchRatio =
+        lfoDepthNorm > 0.005 && lfoSynced && lfoTarget === 'PITCH'
+          ? Math.pow(2, (lfoVal * lfoDepthNorm * 700) / 1200)
+          : 1.0;
+      const lfoFmHarmRatio =
+        lfoDepthNorm > 0.005 && lfoTarget === 'FM'
+          ? Math.pow(2, (lfoVal * lfoDepthNorm * 420) / 1200)
+          : 1.0;
+      const fmDepthHz =
+        lfoDepthNorm > 0.005 && lfoTarget === 'FM'
+          ? Math.max(baseFmHz, 28) * clamp(1 + lfoVal * lfoDepthNorm * 0.9, 0.06, 2.3)
+          : baseFmHz;
+      const lfoAmpScale =
+        lfoDepthNorm > 0.005 && lfoSynced && lfoTarget === 'AMP'
+          ? clamp(1 - (1 - lfoVal) * 0.5 * lfoDepthNorm * 0.94, 0.04, 1.0)
+          : 1.0;
+
+      // Instantaneous body, sub, and harmonic frequencies along exponential pitch-drop curves
+      let instBodyHz: number;
+      if (t < fastSnapSec) {
+        instBodyHz = peakBodyHz * Math.pow(kneeHz / peakBodyHz, t / Math.max(1e-5, fastSnapSec));
+      } else if (t < bodyLandSec) {
+        instBodyHz =
+          kneeHz *
+          Math.pow(
+            rootHz / kneeHz,
+            (t - fastSnapSec) / Math.max(1e-5, bodyLandSec - fastSnapSec)
+          );
+      } else if (t < bodyTailEndSec) {
+        instBodyHz =
+          rootHz *
+          Math.pow(
+            bodyFloorHz / rootHz,
+            (t - bodyLandSec) / Math.max(1e-5, bodyTailEndSec - bodyLandSec)
+          );
+      } else {
+        instBodyHz = bodyFloorHz;
+      }
+      instBodyHz *= lfoPitchRatio;
+
+      const instSubHz =
+        (t < subLandSec
+          ? subStartHz * Math.pow(rootHz / subStartHz, t / Math.max(1e-5, subLandSec))
+          : rootHz) * lfoPitchRatio;
+
+      const instHarmHz =
+        (t < harmLandSec
+          ? harmStartHz * Math.pow(harmEndHz / harmStartHz, t / Math.max(1e-5, harmLandSec))
+          : harmEndHz) *
+        lfoPitchRatio *
+        lfoFmHarmRatio;
+
+      const dtHarm = clamp(instHarmHz / sr, 1e-6, 0.47);
+      const harmSampleBefore = evalKickWave(harmType, harmPhase, dtHarm);
+
+      const modBodyHz = clamp(instBodyHz + harmSampleBefore * fmDepthHz, 18, sr * 0.47);
+      const dtBody = clamp(modBodyHz / sr, 1e-6, 0.47);
+      const bodySample = evalKickWave(bodyType, bodyPhase, dtBody);
+      const subSample = Math.sin(subPhase);
+
+      // Advance phase accumulators & execute Master -> Slave Hard-Sync on 2π body wrap
+      const dBody = (TWO_PI * modBodyHz) / sr;
+      const dSub = (TWO_PI * instSubHz) / sr;
+      const dHarm = (TWO_PI * instHarmHz) / sr;
+
+      bodyPhase += dBody;
+      subPhase += dSub;
+      harmPhase += dHarm;
+
+      let harmSample = harmSampleBefore;
+      if (phaseMode === 'HARD') {
+        const curMasterCycle = Math.floor((bodyPhase - startPhaseRad) / TWO_PI);
+        if (curMasterCycle > prevMasterCycle) {
+          const overshoot = bodyPhase - startPhaseRad - curMasterCycle * TWO_PI;
+          const syncFrac = clamp(overshoot / Math.max(1e-9, dBody), 0, 1);
+          harmPhase = startPhaseRad + syncFrac * dHarm;
+          const syncedHarm = evalKickWave(harmType, harmPhase, dtHarm);
+          harmSample = harmSampleBefore * (1 - syncFrac) + syncedHarm * syncFrac;
+          prevMasterCycle = curMasterCycle;
+        }
+      }
+
+      // 4-Stage Kick ADSR Envelope (Attack -> Decay -> Sustain -> Release + Raised-Cosine Zero Guard)
+      let ampEnv: number;
+      if (t < effAtkSec) {
+        ampEnv = t / effAtkSec;
+      } else if (t < sustainEndSec) {
+        ampEnv = susGain + (1.0 - susGain) * Math.exp(-(t - effAtkSec) / decTau);
+      } else {
+        ampEnv = valAtSustainEnd * Math.exp(-(t - sustainEndSec) / relTau);
+      }
+      if (i >= tailFadeStart) {
+        const fadeProg = (i - tailFadeStart + 1) / tailFadeSamples;
+        ampEnv *= 0.5 * (1 + Math.cos(Math.PI * clamp(fadeProg, 0, 1)));
+      }
+
+      const voicedCore =
+        (bodySample * bodyGainVal + subSample * subGainVal + harmSample * harmGainVal) *
+        ampEnv *
+        lfoAmpScale;
+
+      // Deterministic Phase-Aligned Tok Click + Bridged-T Woody Knock
+      let tokOut = 0;
+      let knockOut = 0;
+      if (tokNorm > 0.01) {
+        if (tokData && i < tokDataLen && t < clickDurSec + 0.004) {
+          const clickEnv =
+            t < clickDurSec
+              ? clickPeakGain * Math.pow(0.0001 / Math.max(0.0002, clickPeakGain), t / clickDurSec)
+              : 0;
+          const rawClick = tokData[i] * clickEnv;
+          const bpY = tokB0 * rawClick + tokZ1;
+          tokZ1 = -tokA1 * bpY + tokZ2;
+          tokZ2 = tokB2 * rawClick - tokA2 * bpY;
+          tokOut = bpY;
+        }
+        if (t < knockDurSec + 0.004) {
+          const kHz =
+            t < knockDurSec
+              ? knockStartHz * Math.pow(knockEndHz / knockStartHz, t / knockDurSec)
+              : knockEndHz;
+          const kEnv =
+            t < 0.0008
+              ? knockPeakGain * (t / 0.0008)
+              : t < knockDurSec + 0.002
+              ? knockPeakGain *
+                Math.pow(
+                  0.0001 / Math.max(0.0002, knockPeakGain),
+                  (t - 0.0008) / (knockDurSec + 0.0012)
+                )
+              : 0;
+          knockOut = evalKickWave(knockType, knockPhase, clamp(kHz / sr, 1e-5, 0.45)) * kEnv;
+          knockPhase += (TWO_PI * kHz) / sr;
+        }
+      }
+
+      const rawMix = voicedCore + knockOut * lfoAmpScale + tokOut;
+
+      // Zero-initial-state < 88 Hz Sub Reinforcement + 26 Hz DC-Blocker
+      const subLpY = subB0 * rawMix + subZ1;
+      subZ1 = subB1 * rawMix - subA1 * subLpY + subZ2;
+      subZ2 = subB2 * rawMix - subA2 * subLpY;
+
+      const reinforced = rawMix + subLpY * subReinforceGain;
+
+      const dcFree = hpB0 * reinforced + hpZ1;
+      hpZ1 = hpB1 * reinforced - hpA1 * dcFree + hpZ2;
+      hpZ2 = hpB2 * reinforced - hpA2 * dcFree;
+
+      // Guarantee exact 0.0 on final sample and finite output so consecutive beats never click or poison IIR state
+      const safeDcFree = Number.isFinite(dcFree) ? dcFree : 0;
+      const finalSample = i === totalSamples - 1 ? 0 : safeDcFree;
+      out[i] = finalSample;
+      const absS = Math.abs(finalSample);
+      if (absS > maxAbs) maxAbs = absS;
+    }
+
+    // Calibrate clean peak headroom (<= 0.86 linear = -1.3 dBFS) so master safetyLimiter never engages on dry loops
+    if (maxAbs > 0.86) {
+      const normGain = 0.86 / maxAbs;
+      for (let i = 0; i < totalSamples; i++) {
+        out[i] *= normGain;
+      }
+    }
+
+    if (phaseMode === 'FREE') {
+      this.freeKickBodyPhase = ((bodyPhase % TWO_PI) + TWO_PI) % TWO_PI;
+      this.freeKickSubPhase = ((subPhase % TWO_PI) + TWO_PI) % TWO_PI;
+      this.freeKickHarmPhase = ((harmPhase % TWO_PI) + TWO_PI) % TWO_PI;
+      this.freeKickKnockPhase = ((knockPhase % TWO_PI) + TWO_PI) % TWO_PI;
+    }
+
+    if (canUseCache) {
+      this.cachedKickBuffer = outBuf;
+      this.cachedKickKey = cacheKey;
+    }
+
+    return outBuf;
+  }
+
+  /**
+   * Sample-Accurate Integer-Quantized Kick Trigger.
+   * Plays the deterministic phase-reset / hard-synced `AudioBuffer` on exact integer sample boundaries (`startSample / sr`)
+   * so consecutive loop kicks have zero sub-sample drift, zero FM drift, and zero stateful IIR carry-over.
    */
   private triggerKickHit(hitTime: number, rootHz: number, p: SynthParams): void {
-    if (
-      !this.kickLfoAmpGain ||
-      !this.kickTokBpFilter ||
-      !this.kickTokBuffer ||
-      !this.rumbleDuckGain
-    ) {
+    if (!this.kickLfoAmpGain || !this.rumbleDuckGain) {
       return;
     }
 
     const rawCtx = Tone.getContext().rawContext;
+    const sr = rawCtx.sampleRate || 48000;
     const nowAudio = rawCtx.currentTime;
-    const t0 = Math.max(nowAudio + 0.0008, hitTime);
+    const startSample = Math.max(
+      Math.ceil((nowAudio + 0.001) * sr),
+      Math.round(hitTime * sr)
+    );
+    const t0 = startSample / sr;
     this.lastKickHitAudioTime = t0;
 
-    if (p.kickLfoSync) {
+    if (p.kickLfoSync ?? true) {
       this.kickLfoPhase = 0;
     }
 
-    // 0. Prune completed voices and cleanly micro-choke any still-ringing hit over 2.0 ms at `t0`
+    // Prune completed voices and cleanly micro-choke any overlapping manual retrigger in 2.0 ms
     const remainingVoices: typeof this.activeKickVoices = [];
     for (const prev of this.activeKickVoices) {
       if (prev.stopAt <= nowAudio - 0.03) {
@@ -4414,7 +4979,7 @@ export class AudioEngine {
           prev.chokeGain.gain.cancelScheduledValues(t0);
         }
         prev.chokeGain.gain.linearRampToValueAtTime(0, t0 + 0.002);
-        const chokeStop = t0 + 0.004;
+        const chokeStop = t0 + 0.003;
         prev.stopAt = chokeStop;
         for (const s of prev.sources) {
           try {
@@ -4428,303 +4993,42 @@ export class AudioEngine {
     }
     this.activeKickVoices = remainingVoices;
 
-    const tailType: KickTailType = p.kickTailType ?? '909';
-    const punchNorm = clamp((p.kickPunch ?? 78) / 100, 0, 1);
-    const fmRatio = clamp(p.kickFmRatio ?? 2.0, 0.5, 8.0);
-    const ratioBoost = 0.52 + fmRatio * 0.2;
-    const tokNorm = clamp((p.kickTok ?? 58) / 100, 0, 1);
-    const sweepSec = clamp((p.kickSweepMs ?? 42) / 1000, 0.008, 0.22);
+    const kickBuf = this.renderPhaseLockedKickBuffer(rawCtx, rootHz, p);
+    const voiceDurSec = kickBuf.duration;
+    const voiceStopAt = t0 + voiceDurSec + 0.0005;
 
-    // 4-Stage Kick ADSR Envelope Parameters
-    const atkSec = clamp((p.kickAttackMs ?? 1.2) / 1000, 0.0005, 0.065);
-    const decSec = clamp((p.kickDecayMs ?? 280) / 1000, 0.04, 1.2);
-    const susNorm = clamp((p.kickSustain ?? 64) / 100, 0, 1);
-    const susGain = Math.max(0.0008, susNorm * 0.96);
-    const relSec = clamp((p.kickReleaseMs ?? 220) / 1000, 0.025, 1.2);
-    const bpm = clamp(p.kickBpm ?? 165, 115, 240);
-    const beatSec = 60 / bpm;
-
-    // Extend ring-out guard so 1-shot taps finish their full ADSR + cavern rumble decay
-    const totalEnvSec = atkSec + decSec * 0.75 + susNorm * 0.28 + relSec;
     const rumbleExtraMs = p.kickRumblePower ? 520 : 140;
     const hitOffsetMs = Math.max(0, (t0 - nowAudio) * 1000);
     this.kickRingUntilMs = Math.max(
       this.kickRingUntilMs,
-      performance.now() + hitOffsetMs + totalEnvSec * 1000 + rumbleExtraMs
+      performance.now() + hitOffsetMs + voiceDurSec * 1000 + rumbleExtraMs
     );
 
-    // 1. Configure Per-Hit Oscillator Waveforms & Hard Analog Gain Balance
-    let bodyType: OscillatorType = 'sine';
-    let harmType: OscillatorType = 'triangle';
-    let bodyGainVal = 1.04;
-    let harmGainVal = 0.09;
-    let subGainVal = 0.38;
-    let fmGainVal = 0;
-
-    switch (tailType) {
-      case '909':
-        bodyType = 'sine';
-        harmType = 'triangle';
-        bodyGainVal = 1.05;
-        harmGainVal = 0.09;
-        subGainVal = 0.4;
-        fmGainVal = 0;
-        break;
-      case 'SUB':
-        bodyType = 'sine';
-        harmType = 'sine';
-        bodyGainVal = 0.98;
-        harmGainVal = 0.2;
-        subGainVal = 0.34;
-        fmGainVal = (12 + punchNorm * 42) * ratioBoost;
-        break;
-      case 'SAW':
-        bodyType = 'sawtooth';
-        harmType = 'sawtooth';
-        bodyGainVal = 0.78;
-        harmGainVal = 0.42;
-        subGainVal = 0.48;
-        fmGainVal = (18 + punchNorm * 54) * ratioBoost;
-        break;
-      case 'ZAAG':
-        bodyType = 'sawtooth';
-        harmType = 'sawtooth';
-        bodyGainVal = 0.74;
-        harmGainVal = 0.56;
-        subGainVal = 0.5;
-        fmGainVal = (32 + punchNorm * 74) * ratioBoost;
-        break;
-      case 'KRACH':
-        bodyType = 'sawtooth';
-        harmType = 'square';
-        bodyGainVal = 0.78;
-        harmGainVal = 0.32;
-        subGainVal = 0.54;
-        fmGainVal = (115 + punchNorm * 260) * (0.62 + fmRatio * 0.14);
-        break;
-      case 'PIEP':
-        bodyType = 'sine';
-        harmType = 'sawtooth';
-        bodyGainVal = 0.86;
-        harmGainVal = 0.5;
-        subGainVal = 0.42;
-        fmGainVal = (26 + punchNorm * 64) * ratioBoost;
-        break;
+    const voiceSrc = rawCtx.createBufferSource();
+    voiceSrc.buffer = kickBuf;
+    if (this.liveKickFreeRate !== 1.0 && voiceSrc.playbackRate) {
+      voiceSrc.playbackRate.value = this.liveKickFreeRate;
     }
-
-    const bodyOsc = rawCtx.createOscillator();
-    bodyOsc.type = bodyType;
-
-    const subSineOsc = rawCtx.createOscillator();
-    subSineOsc.type = 'sine';
-
-    const harmOsc = rawCtx.createOscillator();
-    harmOsc.type = harmType;
-
-    if (this.kickBodyDetuneSource) {
-      this.kickBodyDetuneSource.connect(bodyOsc.detune);
-      this.kickBodyDetuneSource.connect(subSineOsc.detune);
-    }
-    if (this.kickHarmDetuneSource) {
-      this.kickHarmDetuneSource.connect(harmOsc.detune);
-    }
-
-    const bodyGain = rawCtx.createGain();
-    bodyGain.gain.value = bodyGainVal;
-    const subSineGain = rawCtx.createGain();
-    subSineGain.gain.value = subGainVal;
-    const harmGain = rawCtx.createGain();
-    harmGain.gain.value = harmGainVal;
-
-    let fmGain: GainNode | null = null;
-    if (fmGainVal > 0 || (p.kickLfoPower && p.kickLfoTarget === 'FM')) {
-      fmGain = rawCtx.createGain();
-      fmGain.gain.value = fmGainVal;
-      harmOsc.connect(fmGain);
-      fmGain.connect(bodyOsc.frequency);
-    }
-
-    const ampEnvGain = rawCtx.createGain();
-    ampEnvGain.gain.value = 0;
 
     const chokeGain = rawCtx.createGain();
     chokeGain.gain.setValueAtTime(1.0, t0);
 
-    bodyOsc.connect(bodyGain);
-    subSineOsc.connect(subSineGain);
-    harmOsc.connect(harmGain);
-
-    bodyGain.connect(ampEnvGain);
-    subSineGain.connect(ampEnvGain);
-    harmGain.connect(ampEnvGain);
-    ampEnvGain.connect(chokeGain);
+    voiceSrc.connect(chokeGain);
     chokeGain.connect(this.kickLfoAmpGain);
 
-    const sources: AudioScheduledSourceNode[] = [bodyOsc, subSineOsc, harmOsc];
-    const nodes: AudioNode[] = [
-      bodyOsc,
-      subSineOsc,
-      harmOsc,
-      bodyGain,
-      subSineGain,
-      harmGain,
-      ampEnvGain,
-      chokeGain,
-    ];
-    if (fmGain) nodes.push(fmGain);
-
-    // 2. Hard Analog Exponential Pitch-Drop Envelope (0.0 rad Phase-Locked at `t0`)
-    const sweepSemitones = tailType === '909' ? 18 + punchNorm * 28 : 18 + punchNorm * 44;
-    const peakBodyHz = clamp(
-      rootHz * Math.pow(2, sweepSemitones / 12),
-      110,
-      tailType === '909' ? 480 : 2600
-    );
-
-    if (tailType === '909') {
-      // Authentic TR-909 dual-slope chest punch: crisp 16ms upper-chest snap into solid fundamental
-      const kneeHz = Math.max(rootHz * 1.48, rootHz + 24);
-      const fastSnapSec = Math.min(0.019, sweepSec * 0.34);
-      bodyOsc.frequency.setValueAtTime(peakBodyHz, t0);
-      bodyOsc.frequency.exponentialRampToValueAtTime(kneeHz, t0 + fastSnapSec);
-      bodyOsc.frequency.exponentialRampToValueAtTime(rootHz, t0 + sweepSec * 1.1);
-      bodyOsc.frequency.exponentialRampToValueAtTime(
-        Math.max(28, rootHz * 0.97),
-        t0 + sweepSec * 1.1 + Math.max(0.18, totalEnvSec * 0.85)
-      );
-    } else {
-      const kneeHz = Math.max(rootHz * 1.55, rootHz + 28);
-      const fastSnapSec = Math.min(0.018, sweepSec * 0.32);
-      bodyOsc.frequency.setValueAtTime(peakBodyHz, t0);
-      bodyOsc.frequency.exponentialRampToValueAtTime(kneeHz, t0 + fastSnapSec);
-      bodyOsc.frequency.exponentialRampToValueAtTime(rootHz, t0 + sweepSec);
-      bodyOsc.frequency.exponentialRampToValueAtTime(
-        Math.max(24, rootHz * 0.94),
-        t0 + sweepSec + Math.max(0.18, totalEnvSec * 0.85)
-      );
-    }
-
-    subSineOsc.frequency.setValueAtTime(
-      Math.min(260, peakBodyHz * (tailType === '909' ? 0.72 : 0.52)),
-      t0
-    );
-    subSineOsc.frequency.exponentialRampToValueAtTime(rootHz, t0 + sweepSec * 0.82);
-
-    if (tailType === '909') {
-      harmOsc.frequency.setValueAtTime(Math.min(520, peakBodyHz * 1.5), t0);
-      harmOsc.frequency.exponentialRampToValueAtTime(rootHz * 2, t0 + sweepSec * 0.7);
-    } else if (tailType === 'PIEP') {
-      const piepTargetHz = clamp((p.kickEqFreqHz ?? 2250) * (0.55 + fmRatio * 0.28), 750, 4800);
-      harmOsc.frequency.setValueAtTime(Math.min(6200, piepTargetHz * 1.45), t0);
-      harmOsc.frequency.exponentialRampToValueAtTime(piepTargetHz, t0 + sweepSec * 0.75);
-    } else if (tailType === 'KRACH') {
-      const krachModHz = clamp(rootHz * fmRatio, 20, 6500);
-      harmOsc.frequency.setValueAtTime(Math.min(7500, krachModHz * 3.1), t0);
-      harmOsc.frequency.exponentialRampToValueAtTime(krachModHz, t0 + sweepSec * 0.9);
-    } else if (tailType === 'ZAAG') {
-      const zaagModHz = clamp(rootHz * fmRatio * 1.016, 20, 6500);
-      harmOsc.frequency.setValueAtTime(Math.min(7500, peakBodyHz * fmRatio * 0.82), t0);
-      harmOsc.frequency.exponentialRampToValueAtTime(zaagModHz, t0 + sweepSec);
-    } else if (tailType === 'SAW') {
-      const sawModHz = clamp(rootHz * fmRatio * 1.006, 20, 6500);
-      harmOsc.frequency.setValueAtTime(Math.min(7500, peakBodyHz * fmRatio * 0.82), t0);
-      harmOsc.frequency.exponentialRampToValueAtTime(sawModHz, t0 + sweepSec);
-    } else {
-      const subModHz = clamp(rootHz * fmRatio, 18, 5200);
-      harmOsc.frequency.setValueAtTime(Math.min(6000, peakBodyHz * fmRatio * 0.75), t0);
-      harmOsc.frequency.exponentialRampToValueAtTime(subModHz, t0 + sweepSec * 0.75);
-    }
-
-    // 3. Sample-Accurate 4-Stage Kick ADSR Envelope (Identical Start = 0 & End = 0 Every Beat)
-    const effAtkSec = Math.max(0.0005, atkSec);
-    const decTau = Math.max(0.012, decSec * 0.28);
-    ampEnvGain.gain.setValueAtTime(0, t0);
-    ampEnvGain.gain.linearRampToValueAtTime(1.0, t0 + effAtkSec);
-    ampEnvGain.gain.setTargetAtTime(susGain, t0 + effAtkSec, decTau);
-
-    let voiceStopAt: number;
-    if (p.kickLoop) {
-      const maxSustainEnd = t0 + Math.max(effAtkSec + 0.018, beatSec * 0.74);
-      const sustainEnd = Math.min(
-        maxSustainEnd,
-        t0 + effAtkSec + decSec * 0.52 + beatSec * 0.24 * susNorm
-      );
-      const loopGateLimit = t0 + Math.max(effAtkSec + 0.03, beatSec - 0.003);
-      const relTau = Math.max(0.01, Math.min(relSec * 0.24, (loopGateLimit - sustainEnd) * 0.36));
-      ampEnvGain.gain.setTargetAtTime(0.0001, sustainEnd, Math.max(0.006, relTau));
-      ampEnvGain.gain.linearRampToValueAtTime(0, loopGateLimit);
-      voiceStopAt = loopGateLimit + 0.004;
-    } else {
-      const sustainEnd = t0 + effAtkSec + decSec * 0.65 + susNorm * Math.min(0.32, decSec * 0.45);
-      const relTau = Math.max(0.012, relSec * 0.3);
-      ampEnvGain.gain.setTargetAtTime(0.0001, sustainEnd, relTau);
-      const endZero = sustainEnd + relTau * 5.6;
-      ampEnvGain.gain.linearRampToValueAtTime(0, endZero);
-      voiceStopAt = endZero + 0.01;
-    }
-
-    // 4. Deterministic Phase-Locked Tok Click + 0° Constructive Bridged-T Knock (0 - 22 ms)
-    if (tokNorm > 0.01) {
-      const tokSrc = rawCtx.createBufferSource();
-      tokSrc.buffer = this.kickTokBuffer;
-
-      const tokGain = rawCtx.createGain();
-      const clickPeak = tokNorm * (p.kickTokBoost ? 0.92 : tailType === '909' ? 0.58 : 0.72);
-      const clickDur = tailType === '909' ? 0.0085 : 0.011;
-      tokGain.gain.setValueAtTime(clickPeak, t0);
-      tokGain.gain.exponentialRampToValueAtTime(0.0001, t0 + clickDur);
-      tokGain.gain.linearRampToValueAtTime(0, t0 + clickDur + 0.002);
-
-      tokSrc.connect(tokGain);
-      tokGain.connect(this.kickTokBpFilter);
-      tokSrc.start(t0);
-      tokSrc.stop(Math.min(voiceStopAt, t0 + 0.032));
-      sources.push(tokSrc);
-      nodes.push(tokSrc, tokGain);
-
-      const knockOsc = rawCtx.createOscillator();
-      knockOsc.type = tailType === '909' ? 'sine' : 'triangle';
-      const knockStartHz = p.kickTokBoost ? 520 : tailType === '909' ? 320 : 380;
-      const knockEndHz = tailType === '909' ? 68 : 88;
-      const knockDur = tailType === '909' ? 0.021 : 0.016;
-      knockOsc.frequency.setValueAtTime(knockStartHz, t0);
-      knockOsc.frequency.exponentialRampToValueAtTime(knockEndHz, t0 + knockDur);
-
-      const knockGain = rawCtx.createGain();
-      knockGain.gain.setValueAtTime(0, t0);
-      knockGain.gain.linearRampToValueAtTime(
-        tokNorm * (tailType === '909' ? 0.84 : 0.72),
-        t0 + 0.0008
-      );
-      knockGain.gain.exponentialRampToValueAtTime(0.0001, t0 + knockDur + 0.002);
-      knockGain.gain.linearRampToValueAtTime(0, t0 + knockDur + 0.004);
-
-      knockOsc.connect(knockGain);
-      knockGain.connect(chokeGain);
-      knockOsc.start(t0);
-      knockOsc.stop(Math.min(voiceStopAt, t0 + knockDur + 0.006));
-      sources.push(knockOsc);
-      nodes.push(knockOsc, knockGain);
-    }
-
-    bodyOsc.start(t0);
-    subSineOsc.start(t0);
-    harmOsc.start(t0);
-
-    bodyOsc.stop(voiceStopAt);
-    subSineOsc.stop(voiceStopAt);
-    harmOsc.stop(voiceStopAt);
+    voiceSrc.start(t0);
+    voiceSrc.stop(voiceStopAt);
 
     this.activeKickVoices.push({
       chokeGain,
-      fmGain,
       stopAt: voiceStopAt,
-      sources,
-      nodes,
+      sources: [voiceSrc],
+      nodes: [voiceSrc, chokeGain],
     });
 
-    // 5. Kick-Triggered Industrial Rumble Sidechain Duck & Off-Beat Swell
+    // Kick-Triggered Industrial Rumble Sidechain Duck & Off-Beat Swell
     if (this.isKickRumbleWired && p.kickRumblePower) {
+      const beatSec = this.getQuantizedKickBeatSamples(p, sr) / sr;
       const rumbleLevel = clamp((p.kickRumbleAmt ?? 0) / 100, 0, 1) * 0.88;
       const duckNorm = clamp((p.kickDuck ?? 75) / 100, 0, 1);
       const duckFloor = rumbleLevel * (1 - duckNorm * 0.94);
@@ -4744,7 +5048,7 @@ export class AudioEngine {
       if (!p.kickLoop) {
         this.rumbleDuckGain.gain.setTargetAtTime(
           0.0001,
-          t0 + Math.max(0.22, totalEnvSec * 0.75),
+          t0 + Math.max(0.22, voiceDurSec * 0.75),
           0.14
         );
       }
@@ -4853,8 +5157,8 @@ export class AudioEngine {
 
       const kickTarget = isSounding && (p.kickPower ?? true) ? 0.96 : 0;
       if (kickTarget > 0) {
-        // Open instantaneously before t0 so Kick #1's 0ms transient is 100% identical to Kick #2..N!
-        setParamDirect(this.kickVoiceGate.gain, kickTarget);
+        // Cancel any prior setTargetAtTime(0) automation and open instantaneously before t0 so Kick #1 == Kick #2..N!
+        setAudioParamImmediate(this.kickVoiceGate.gain, kickTarget, rawNow);
       } else {
         rampAudioGate(this.kickVoiceGate.gain, 0, rawNow, 0.035);
       }
@@ -4917,13 +5221,17 @@ export class AudioEngine {
     this.applyPlayerGranularProps(params);
 
     if (params.kickMode && (params.kickPower ?? true) && retrigger) {
-      const rawNow = Tone.getContext().rawContext.currentTime;
+      this.updateVoiceGates();
+      const rawCtx = Tone.getContext().rawContext;
+      const sr = rawCtx.sampleRate || 48000;
+      const rawNow = rawCtx.currentTime;
       const rootHz = this.computeKickRootHz(midi + params.basePitchSemitones);
-      // Schedule 6ms ahead so t0 lands cleanly ahead of Web Audio's 128-sample render block
-      const hitAt = rawNow + 0.006;
+      // Quantize initial trigger & loop stride to exact integer hardware sample frames
+      const startFrame = Math.ceil((rawNow + 0.006) * sr);
+      const hitAt = startFrame / sr;
       this.triggerKickHit(hitAt, rootHz, params);
-      const bpm = clamp(params.kickBpm ?? 150, 115, 240);
-      this.nextKickHitTime = hitAt + 60 / bpm;
+      const beatSamples = this.getQuantizedKickBeatSamples(params, sr);
+      this.nextKickHitTime = (startFrame + beatSamples) / sr;
       this.envPhase = 0;
     } else if (!params.kickMode) {
       this.triggerSynthAdsrOn(params, retrigger || wasSilent);
@@ -4986,14 +5294,18 @@ export class AudioEngine {
       this.applyPlayerGranularProps(params);
 
       if (params.kickMode && (params.kickPower ?? true)) {
-        const rawNow = Tone.getContext().rawContext.currentTime;
+        this.updateVoiceGates();
+        const rawCtx = Tone.getContext().rawContext;
+        const sr = rawCtx.sampleRate || 48000;
+        const rawNow = rawCtx.currentTime;
         const midi =
           (this.activeMidiNote !== null ? this.activeMidiNote : this.lastPlayedMidi) +
           params.basePitchSemitones;
-        const hitAt = rawNow + 0.006;
+        const startFrame = Math.ceil((rawNow + 0.006) * sr);
+        const hitAt = startFrame / sr;
         this.triggerKickHit(hitAt, this.computeKickRootHz(midi), params);
-        const bpm = clamp(params.kickBpm ?? 150, 115, 240);
-        this.nextKickHitTime = hitAt + 60 / bpm;
+        const beatSamples = this.getQuantizedKickBeatSamples(params, sr);
+        this.nextKickHitTime = (startFrame + beatSamples) / sr;
         this.envPhase = 0;
       } else if (!params.kickMode) {
         this.triggerSynthAdsrOn(params, true);
@@ -5272,8 +5584,19 @@ export class AudioEngine {
     }
 
     const wetRatio = clamp(params.dryWet / 100, 0, 1);
-    rampAudioGate(this.dryBranch.gain, (1 - wetRatio) * 0.7, rawNow, 0.018);
-    rampAudioGate(this.wetBranch.gain, 0.25 + wetRatio * 0.85, rawNow, 0.018);
+    if (
+      params.kickMode &&
+      this.kickDirectRoutingMode === 'PURE_DIRECT' &&
+      !this.isOttWired &&
+      !this.isSpaceWired
+    ) {
+      // Unity single-path phase-linear pass-through in pure Kick Mode (cancels prior setTargetAtTime automations!)
+      setAudioParamImmediate(this.dryBranch.gain, 0, rawNow);
+      setAudioParamImmediate(this.wetBranch.gain, 1.0, rawNow);
+    } else {
+      rampAudioGate(this.dryBranch.gain, (1 - wetRatio) * 0.7, rawNow, 0.018);
+      rampAudioGate(this.wetBranch.gain, 0.25 + wetRatio * 0.85, rawNow, 0.018);
+    }
 
     setParamDirect(this.hpFilter.frequency, clamp(params.hpFreq, 20, 600), 0.2);
     setParamDirect(this.lpFilter.frequency, clamp(params.lpFreq, 500, 20000), 1);
@@ -5508,24 +5831,33 @@ export class AudioEngine {
   updateLiveParams(params: SynthParams): void {
     const prevKickMode = Boolean(this.currentParams?.kickMode);
     const nextKickMode = Boolean(params.kickMode);
+    const prevKickLoop = Boolean(this.currentParams?.kickLoop);
+    const nextKickLoop = Boolean(params.kickLoop);
     this.currentParams = { ...params };
     if (this.isGraphBuilt) {
       this.applyOscPanelProps(params);
       this.applyFxChainProps(params);
       this.applyKickChainProps(params);
 
-      // If user flips from Synth -> Kick while Drone Play or a held note is active, fire the Kick immediately!
-      if (!prevKickMode && nextKickMode && (this.isDronePlaying || this.activeMidiNote !== null)) {
+      // If user flips from Synth -> Kick (or enables 4/4 Loop) while Drone Play or a held note is active, fire the Kick immediately!
+      if (
+        ((!prevKickMode && nextKickMode) || (nextKickMode && !prevKickLoop && nextKickLoop)) &&
+        (this.isDronePlaying || this.activeMidiNote !== null)
+      ) {
         this.wakeVoicesIfNeeded();
         this.syncSubgraphRouting(params);
         this.applyKickChainProps(params);
-        const rawNow = Tone.getContext().rawContext.currentTime;
+        this.updateVoiceGates();
+        const rawCtx = Tone.getContext().rawContext;
+        const sr = rawCtx.sampleRate || 48000;
+        const rawNow = rawCtx.currentTime;
         const midi =
           (this.activeMidiNote !== null ? this.activeMidiNote : this.lastPlayedMidi) +
           params.basePitchSemitones;
-        const hitAt = rawNow + 0.006;
+        const startFrame = Math.ceil((rawNow + 0.006) * sr);
+        const hitAt = startFrame / sr;
         this.triggerKickHit(hitAt, this.computeKickRootHz(midi), params);
-        this.nextKickHitTime = hitAt + 60 / clamp(params.kickBpm ?? 150, 115, 240);
+        this.nextKickHitTime = (startFrame + this.getQuantizedKickBeatSamples(params, sr)) / sr;
       } else if (
         prevKickMode &&
         !nextKickMode &&
@@ -5707,8 +6039,9 @@ export class AudioEngine {
           true
         );
       } else {
-        if (this.synthAmpEnvGain) this.synthAmpEnvGain.gain.value = 0;
-        if (this.synthSubEnvGain) this.synthSubEnvGain.gain.value = 0;
+        const rawNow = Tone.getContext().rawContext.currentTime;
+        if (this.synthAmpEnvGain) setAudioParamImmediate(this.synthAmpEnvGain.gain, 0, rawNow);
+        if (this.synthSubEnvGain) setAudioParamImmediate(this.synthSubEnvGain.gain, 0, rawNow);
         this.updateLiveParams(snap.params);
       }
     }

@@ -1,6 +1,13 @@
 import React, { useState, useRef, useEffect, useCallback, useId } from 'react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
-import { KickClipMode, KickLfoShape, KickLfoTarget, KickTailType, SynthLfoTarget } from '../../types';
+import {
+  KickClipMode,
+  KickLfoShape,
+  KickLfoTarget,
+  KickPhaseMode,
+  KickTailType,
+  SynthLfoTarget,
+} from '../../types';
 import { ACCENT_PALETTES, clamp, DspAccent } from './tokens';
 import { MidiLearnOverlayTag, useMidiLearnTarget } from './MidiLearnContext';
 import { cn } from '../../utils';
@@ -12,11 +19,14 @@ const KICK_LFO_TARGETS: KickLfoTarget[] = ['HUNT', 'FM', 'PITCH', 'AMP'];
 const SYNTH_LFO_TARGETS: SynthLfoTarget[] = ['GROWL', 'VOWEL', 'FILTER', 'PITCH', 'AMP'];
 
 /* ============================================================================
- * 1. KickOscDisplay — Recessed Tok + Pitch-Drop + FM Ratio + Tail Scope (KICK BODY)
+ * 1. KickOscDisplay — Recessed Tok + Pitch-Drop + Phase Lock / Hard-Sync Scope (KICK BODY)
  * ============================================================================ */
 export interface KickOscDisplayProps {
   tailType: KickTailType;
   onChangeTailType: (next: KickTailType) => void;
+  phaseMode?: KickPhaseMode;
+  phaseDeg?: number; // 0..360
+  onCyclePhaseMode?: () => void;
   punch: number; // 0..100
   fmRatio?: number; // 0.5..8.0
   tok: number; // 0..100
@@ -33,6 +43,9 @@ export interface KickOscDisplayProps {
 export const KickOscDisplay = React.memo(function KickOscDisplay({
   tailType,
   onChangeTailType,
+  phaseMode = 'RESET',
+  phaseDeg = 0,
+  onCyclePhaseMode,
   punch,
   fmRatio = 2.0,
   tok,
@@ -60,36 +73,64 @@ export const KickOscDisplay = React.memo(function KickOscDisplay({
   const decayNorm = clamp((decayMs - 60) / 1140, 0.06, 1);
   const susNorm = clamp(sustain / 100, 0, 1);
   const safeRatio = clamp(fmRatio, 0.5, 8.0);
+  const safePhaseDeg = clamp(phaseDeg, 0, 360);
 
-  // Build synthesized kick waveform + FM harmonic overtones + ADSR contour preview
+  // Build synthesized kick waveform + Phase Reset / Hard-Sync slave lock + ADSR contour preview
   const { wavePath, envPath } = React.useMemo(() => {
     const wPts: string[] = [];
     const ePts: string[] = [];
     const steps = 72;
-    let phase = 0;
+    const startCyc = phaseMode === 'FREE' ? 0.37 : safePhaseDeg / 360;
+    let masterPhase = startCyc;
+    let slavePhase = startCyc;
+    let prevMasterInt = Math.floor(masterPhase - startCyc);
 
     for (let i = 0; i <= steps; i++) {
       const t = i / steps;
-      // Exponential pitch-drop frequency multiplier
       const sweepDecay = Math.exp(-t / (0.06 + sweepNorm * 0.24));
       const freqMult = 1.55 + sweepDecay * (4.0 + punchNorm * 6.2);
 
-      // ADSR Decay -> Sustain plateau -> Tail release preview
       const decEnd = 0.14 + decayNorm * 0.34;
       const tailEnv =
         t <= decEnd
           ? susNorm + (1 - susNorm) * Math.exp(-t / Math.max(0.05, decEnd * 0.45))
           : susNorm * Math.exp(-(t - decEnd) / 0.42);
 
-      phase += (freqMult * 0.15) % 1;
-      const cyc = phase % 1;
-      const fmMod = Math.sin(cyc * Math.PI * 2 * safeRatio);
+      if (i > 0) {
+        const dMaster = freqMult * 0.15;
+        const detFactor =
+          phaseMode === 'HARD'
+            ? 1.0
+            : tailType === 'ZAAG'
+            ? 1.02
+            : tailType === 'SAW'
+            ? 1.008
+            : 1.0;
+        const dSlave = dMaster * safeRatio * detFactor;
+        masterPhase += dMaster;
+        slavePhase += dSlave;
+
+        if (phaseMode === 'HARD') {
+          const curMasterInt = Math.floor(masterPhase - startCyc);
+          if (curMasterInt > prevMasterInt) {
+            const frac = ((masterPhase - startCyc) - curMasterInt) / Math.max(1e-6, dMaster);
+            slavePhase = startCyc + clamp(frac, 0, 1) * dSlave;
+            prevMasterInt = curMasterInt;
+          }
+        }
+      }
+
+      const cyc = ((masterPhase % 1) + 1) % 1;
+      const sCyc = ((slavePhase % 1) + 1) % 1;
+      const fmMod = Math.sin(sCyc * Math.PI * 2);
 
       let carrier = 0;
       switch (tailType) {
         case '909': {
-          // Pure analog TR-909 sine drum + Bridged-T 175 Hz woody knock (zero FM dirt)
-          const knock = t < 0.16 ? Math.sin(t * Math.PI * 26) * Math.exp(-t * 18) * 0.34 : 0;
+          const knock =
+            t < 0.16
+              ? Math.sin((t * 13 + startCyc * 0.5) * Math.PI * 2) * Math.exp(-t * 18) * 0.34
+              : 0;
           carrier = clamp(Math.sin(cyc * Math.PI * 2) * 0.94 + knock, -1, 1);
           break;
         }
@@ -98,18 +139,15 @@ export const KickOscDisplay = React.memo(function KickOscDisplay({
           break;
         case 'SAW': {
           const warped = (((cyc + fmMod * 0.08 * safeRatio) % 1) + 1) % 1;
-          carrier = (1 - 2 * warped) * 0.8 + fmMod * 0.24;
+          carrier = (1 - 2 * warped) * 0.8 + (1 - 2 * sCyc) * 0.24;
           carrier = clamp(carrier, -1, 1);
           break;
         }
         case 'ZAAG':
-          carrier =
-            (1 - 2 * cyc) * 0.58 +
-            (1 - 2 * ((cyc * safeRatio * 1.02 + 0.2) % 1)) * 0.52;
+          carrier = (1 - 2 * cyc) * 0.58 + (1 - 2 * sCyc) * 0.52;
           carrier = clamp(carrier * 1.35, -1, 1);
           break;
         case 'KRACH':
-          // Microwave FM buzz wave driven by FM Ratio
           carrier = Math.sin(
             cyc * Math.PI * 2 + fmMod * (1.45 + punchNorm * 1.2 + safeRatio * 0.22)
           );
@@ -118,12 +156,11 @@ export const KickOscDisplay = React.memo(function KickOscDisplay({
         case 'PIEP':
           carrier =
             Math.sin(cyc * Math.PI * 2) * 0.56 +
-            Math.sin(t * Math.PI * (22 + safeRatio * 7.5)) * 0.56 * (0.35 + tailEnv * 0.65);
+            (1 - 2 * sCyc) * 0.52 * (0.35 + tailEnv * 0.65);
           carrier = clamp(carrier * 1.25, -1, 1);
           break;
       }
 
-      // Initial Tok click spike near t = 0
       const tokSpike = t < 0.065 ? (1 - t / 0.065) * tokNorm * (i % 2 === 0 ? 1 : -0.92) : 0;
       const sample = clamp(carrier * clamp(tailEnv, 0.05, 1) * 0.88 + tokSpike * 0.65, -1, 1);
 
@@ -135,7 +172,7 @@ export const KickOscDisplay = React.memo(function KickOscDisplay({
       ePts.push(`${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${yEnv.toFixed(1)}`);
     }
     return { wavePath: wPts.join(' '), envPath: ePts.join(' ') };
-  }, [tailType, punchNorm, tokNorm, sweepNorm, decayNorm, susNorm, safeRatio]);
+  }, [tailType, phaseMode, safePhaseDeg, punchNorm, tokNorm, sweepNorm, decayNorm, susNorm, safeRatio]);
 
   const ratioLabel =
     tailType === '909'
@@ -143,6 +180,13 @@ export const KickOscDisplay = React.memo(function KickOscDisplay({
       : Number.isInteger(safeRatio)
       ? `${safeRatio.toFixed(1)}x`
       : `${safeRatio.toFixed(2).replace(/0$/, '')}x`;
+
+  const phaseTag =
+    phaseMode === 'HARD'
+      ? `SYNC ${Math.round(safePhaseDeg)}°`
+      : phaseMode === 'RESET'
+      ? `RST ${Math.round(safePhaseDeg)}°`
+      : 'FREE';
 
   return (
     <div className="relative w-full min-w-0" onContextMenu={midi.handleContextMenu}>
@@ -176,8 +220,8 @@ export const KickOscDisplay = React.memo(function KickOscDisplay({
           style={{ background: palette.wellGlow }}
         />
 
-        {/* Top Row: Kick Tail Engine + FM Ratio + Trigger Mode */}
-        <div className="relative z-10 flex items-center justify-between gap-1 whitespace-nowrap">
+        {/* Top Row: Kick Tail Engine + Phase Lock / Hard-Sync Selector */}
+        <div className="relative z-10 flex items-center justify-between gap-1.5 whitespace-nowrap">
           <div className="inline-flex items-center gap-1 min-w-0">
             <span
               className="font-display font-semibold text-[8.5px] tracking-[0.09em] uppercase"
@@ -188,17 +232,40 @@ export const KickOscDisplay = React.memo(function KickOscDisplay({
             >
               {tailType}
             </span>
-            <span className="font-mono text-[8px] tabular-nums text-[#8DA2B8]">
+            <span className="font-mono text-[7.5px] tabular-nums text-[#8DA2B8]">
               {ratioLabel}
             </span>
           </div>
 
-          {onToggleLoop ? (
+          {onCyclePhaseMode ? (
+            <button
+              type="button"
+              onClick={() => !midi.enabled && onCyclePhaseMode()}
+              title={
+                phaseMode === 'HARD'
+                  ? `Hard-Sync Active (${Math.round(safePhaseDeg)}° Master-to-Slave Lock) — click for Free / Phase Reset`
+                  : phaseMode === 'RESET'
+                  ? `Phase Reset Active (${Math.round(safePhaseDeg)}° Fixed Trigger Phase) — click for Hard-Sync`
+                  : 'Free-Running Phase — click for Fixed Phase Reset'
+              }
+              className="font-mono text-[8px] font-medium tabular-nums tracking-[0.03em] hover:text-white transition-colors cursor-pointer focus-visible:outline-none shrink-0"
+              style={{
+                color:
+                  phaseMode === 'HARD'
+                    ? '#FFD099'
+                    : phaseMode === 'RESET'
+                    ? palette.bright
+                    : '#8E96AA',
+              }}
+            >
+              {phaseTag}
+            </button>
+          ) : onToggleLoop ? (
             <button
               type="button"
               onClick={() => !midi.enabled && onToggleLoop()}
               title="Toggle 1-Shot Drum Hit vs 4/4 BPM Stomper Loop"
-              className="font-mono text-[8px] tabular-nums text-[#9BA3B8] hover:text-white transition-colors cursor-pointer focus-visible:outline-none"
+              className="font-mono text-[8px] tabular-nums text-[#9BA3B8] hover:text-white transition-colors cursor-pointer focus-visible:outline-none shrink-0"
               style={{
                 color: loopActive ? palette.bright : '#8E96AA',
               }}
@@ -212,7 +279,7 @@ export const KickOscDisplay = React.memo(function KickOscDisplay({
           )}
         </div>
 
-        {/* Bottom Row: Chevrons + Live Kick Transient & FM Tail Oscilloscope */}
+        {/* Bottom Row: Chevrons + Live Kick Transient & Phase-Locked Tail Oscilloscope */}
         <div className="relative z-10 w-full flex items-center justify-between gap-0.5">
           <button
             type="button"
@@ -236,6 +303,18 @@ export const KickOscDisplay = React.memo(function KickOscDisplay({
               stroke="rgba(255,255,255,0.08)"
               strokeWidth="1"
             />
+            {phaseMode !== 'FREE' && (
+              <line
+                x1="0.8"
+                y1="4"
+                x2="0.8"
+                y2="36"
+                stroke={phaseMode === 'HARD' ? '#FFB35C' : palette.bright}
+                strokeOpacity="0.55"
+                strokeWidth="1.2"
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
             <path
               d={envPath}
               fill="none"

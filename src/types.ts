@@ -16,6 +16,7 @@ export type SubThumpMode = 'FAST' | 'PUNCH' | '808';
 export type OttFlavorMode = 'UPWARD' | 'SLAM' | 'CRISP';
 export type PhaseScopeMode = 'goniometer' | 'lissajous';
 export type KickTailType = '909' | 'SUB' | 'SAW' | 'ZAAG' | 'KRACH' | 'PIEP';
+export type KickPhaseMode = 'RESET' | 'HARD' | 'FREE';
 export type KickClipMode = 'GABBER' | 'GCLIP' | 'FOLD' | 'ZAAG' | 'BOILER';
 export type KickLfoShape = 'SINE' | 'TRI' | 'SAW' | 'SQR';
 export type KickLfoTarget = 'HUNT' | 'FM' | 'PITCH' | 'AMP';
@@ -83,9 +84,11 @@ export interface SynthParams {
   // Tab 1 Engine Switch: Synth & Master (false) vs Kick & Master (true)
   kickMode?: boolean;
 
-  // Kick & Master — Panel 1: KICK BODY, FM RATIO & TOK (Cyan)
+  // Kick & Master — Panel 1: KICK BODY, FM RATIO, PHASE LOCK & TOK (Cyan)
   kickPower?: boolean;
   kickTailType?: KickTailType; // '909' | 'SUB' | 'SAW' | 'ZAAG' | 'KRACH' | 'PIEP'
+  kickPhaseMode?: KickPhaseMode; // 'RESET' (fixed phase reset) | 'HARD' (master->slave hard-sync) | 'FREE' (analog drift)
+  kickPhaseDeg?: number; // 0 to 360 deg fixed start phase on every trigger (default 0°)
   kickPunch?: number; // 0 to 100 % Exponential pitch-drop depth & body impact
   kickFmRatio?: number; // 0.5 to 8.0 Harmonic FM ratio modulating sub/kick overtones
   kickTok?: number; // 0 to 100 % High-frequency click + woody transient knock

@@ -73,6 +73,7 @@ import {
   KickClipMode,
   KickLfoShape,
   KickLfoTarget,
+  KickPhaseMode,
   KickTailType,
   OscWaveType,
   OttFlavorMode,
@@ -114,6 +115,7 @@ const OSC_WAVES: OscWaveType[] = ['SAW', 'PULSE', 'SUPER', 'SYNC', 'METAL', 'TRI
 const TONE_MODES: ToneMode[] = ['TEAROUT', 'ROAR', 'YOI', 'SCREAM', 'TUBE', 'CLIP'];
 const FM_RATIOS = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0];
 const KICK_TAIL_TYPES: KickTailType[] = ['909', 'SUB', 'SAW', 'ZAAG', 'KRACH', 'PIEP'];
+const KICK_PHASE_MODES: KickPhaseMode[] = ['RESET', 'HARD', 'FREE'];
 const KICK_CLIP_MODES: KickClipMode[] = ['GABBER', 'GCLIP', 'FOLD', 'ZAAG', 'BOILER'];
 const KICK_LFO_SHAPES: KickLfoShape[] = ['SINE', 'TRI', 'SAW', 'SQR'];
 const KICK_LFO_TARGETS: KickLfoTarget[] = ['HUNT', 'FM', 'PITCH', 'AMP'];
@@ -250,6 +252,8 @@ const INIT_SYNTH_PARAMS: SynthParams = {
   kickMode: false,
   kickPower: true,
   kickTailType: '909',
+  kickPhaseMode: 'RESET',
+  kickPhaseDeg: 0,
   kickPunch: 78,
   kickFmRatio: 1.5,
   kickTok: 58,
@@ -2280,6 +2284,8 @@ const SYNTH_PRESETS: SynthPreset[] = [
       kickMode: true,
       kickPower: true,
       kickTailType: 'ZAAG',
+      kickPhaseMode: 'HARD',
+      kickPhaseDeg: 0,
       kickPunch: 85,
       kickFmRatio: 2.0,
       kickTok: 76,
@@ -2347,6 +2353,8 @@ const SYNTH_PRESETS: SynthPreset[] = [
       kickMode: true,
       kickPower: true,
       kickTailType: 'SAW',
+      kickPhaseMode: 'HARD',
+      kickPhaseDeg: 0,
       kickPunch: 82,
       kickFmRatio: 1.75,
       kickTok: 82,
@@ -3879,6 +3887,11 @@ export default function App() {
       kickMode: inKickMode,
       kickPower: true,
       kickTailType: nextKickTail,
+      kickPhaseMode:
+        nextKickTail === 'ZAAG' || nextKickTail === 'SAW' || Math.random() > 0.65
+          ? 'HARD'
+          : 'RESET',
+      kickPhaseDeg: Math.random() > 0.72 ? pickRandom([0, 15, 30, 45]) : 0,
       kickPunch: randBetween(70, 94, 1),
       kickFmRatio: randBetween(0.75, 4.5, 0.25),
       kickTok: randBetween(42, 86, 1),
@@ -4016,6 +4029,11 @@ export default function App() {
             patch = {
               kickPower: true,
               kickTailType: nextTail,
+              kickPhaseMode:
+                nextTail === 'ZAAG' || nextTail === 'SAW' || Math.random() > 0.6
+                  ? 'HARD'
+                  : 'RESET',
+              kickPhaseDeg: Math.random() > 0.7 ? pickRandom([0, 15, 30, 45]) : 0,
               kickPunch: randBetween(68, 98, 1),
               kickFmRatio: randBetween(0.5, 6.5, 0.25),
               kickTok: randBetween(38, 95, 1),
@@ -4271,6 +4289,13 @@ export default function App() {
     const idx = OSC_INTERVAL_STEPS.indexOf(params.oscInterval);
     const next = OSC_INTERVAL_STEPS[(idx + 1) % OSC_INTERVAL_STEPS.length];
     updateParam('oscInterval', next);
+  };
+
+  const cycleKickPhaseMode = () => {
+    const curMode: KickPhaseMode = params.kickPhaseMode ?? 'RESET';
+    const idx = KICK_PHASE_MODES.indexOf(curMode);
+    const next = KICK_PHASE_MODES[(idx + 1) % KICK_PHASE_MODES.length];
+    updateParam('kickPhaseMode', next);
   };
 
   const handleRemoveSample = () => {
@@ -5062,16 +5087,18 @@ export default function App() {
                           onToggle={() => updateParam('kickTokBoost', !params.kickTokBoost)}
                         />
                         <IconToggleButton
-                          icon="loop"
-                          midiId="kickLoop"
+                          icon="phase"
+                          midiId="kickPhaseMode"
                           label={
-                            params.kickLoop
-                              ? '4/4 BPM Stomper Loop Active'
-                              : '1-Shot Drum Trigger Mode'
+                            (params.kickPhaseMode ?? 'RESET') === 'RESET'
+                              ? `Phase Reset (${Math.round(params.kickPhaseDeg ?? 0)}°) — Zero Drift on Every Trigger`
+                              : (params.kickPhaseMode ?? 'RESET') === 'HARD'
+                              ? `Master-to-Slave Hard Sync (${Math.round(params.kickPhaseDeg ?? 0)}°) — Locked Harmonics`
+                              : 'Free-Running Oscillator Phase (Analog Drift)'
                           }
-                          active={Boolean(params.kickLoop)}
+                          active={(params.kickPhaseMode ?? 'RESET') !== 'FREE'}
                           accent="cyan"
-                          onToggle={() => updateParam('kickLoop', !params.kickLoop)}
+                          onToggle={cycleKickPhaseMode}
                         />
                         <IconToggleButton
                           icon="power"
@@ -5090,11 +5117,11 @@ export default function App() {
                           size="md"
                           midiId="kickPunch"
                           accent="cyan"
-                          value={params.kickPunch ?? 82}
+                          value={params.kickPunch ?? 78}
                           min={0}
                           max={100}
                           step={1}
-                          defaultValue={82}
+                          defaultValue={INIT_SYNTH_PARAMS.kickPunch}
                           label="PUNCH"
                           showPerimeterDots
                           formatValue={(v) => `+${Math.round(18 + (v / 100) * 44)} st Drop`}
@@ -5105,6 +5132,9 @@ export default function App() {
                         <KickOscDisplay
                           midiId="kickTailType"
                           tailType={params.kickTailType ?? '909'}
+                          phaseMode={params.kickPhaseMode ?? 'RESET'}
+                          phaseDeg={params.kickPhaseDeg ?? 0}
+                          onCyclePhaseMode={cycleKickPhaseMode}
                           punch={params.kickPunch ?? 78}
                           fmRatio={params.kickFmRatio ?? 1.5}
                           tok={params.kickTok ?? 58}
@@ -5118,16 +5148,16 @@ export default function App() {
                         />
                       </div>
 
-                      <div className="grid grid-cols-3 gap-x-2 w-full justify-items-center items-end">
+                      <div className="grid grid-cols-4 gap-x-1 w-full justify-items-center items-end">
                         <MicroKnob
-                          label="FM RATIO"
+                          label="RATIO"
                           midiId="kickFmRatio"
                           accent="cyan"
-                          value={params.kickFmRatio ?? 2.0}
+                          value={params.kickFmRatio ?? 1.5}
                           min={0.5}
                           max={8.0}
                           step={0.25}
-                          defaultValue={2.0}
+                          defaultValue={INIT_SYNTH_PARAMS.kickFmRatio}
                           formatValue={(v) => `${v.toFixed(2)}x Harm`}
                           onChange={(v) => updateParam('kickFmRatio', v)}
                         />
@@ -5135,11 +5165,11 @@ export default function App() {
                           label="TOK"
                           midiId="kickTok"
                           accent="cyan"
-                          value={params.kickTok ?? 68}
+                          value={params.kickTok ?? 58}
                           min={0}
                           max={100}
                           step={1}
-                          defaultValue={68}
+                          defaultValue={INIT_SYNTH_PARAMS.kickTok}
                           formatValue={(v) => `${Math.round(v)}% Click`}
                           onChange={(v) => updateParam('kickTok', v)}
                         />
@@ -5147,13 +5177,26 @@ export default function App() {
                           label="SWEEP"
                           midiId="kickSweepMs"
                           accent="cyan"
-                          value={params.kickSweepMs ?? 46}
+                          value={params.kickSweepMs ?? 42}
                           min={10}
                           max={180}
                           step={2}
-                          defaultValue={46}
+                          defaultValue={INIT_SYNTH_PARAMS.kickSweepMs}
                           formatValue={(v) => `${Math.round(v)} ms`}
                           onChange={(v) => updateParam('kickSweepMs', v)}
+                        />
+                        <MicroKnob
+                          label="PHASE"
+                          midiId="kickPhaseDeg"
+                          accent="cyan"
+                          value={params.kickPhaseDeg ?? 0}
+                          min={0}
+                          max={360}
+                          step={5}
+                          defaultValue={0}
+                          disabled={(params.kickPhaseMode ?? 'RESET') === 'FREE'}
+                          formatValue={(v) => `${Math.round(v)}° Start`}
+                          onChange={(v) => updateParam('kickPhaseDeg', v)}
                         />
                       </div>
                     </div>
